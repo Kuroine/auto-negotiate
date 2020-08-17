@@ -2,19 +2,19 @@ const CONTRACT_DEAL_REPLY = 35,
 	CONTRACT_DEAL = 36
 
 module.exports = function AutoNegotiate(mod) {
-	mod.settings.$init({
-		version: 1,
-		defaults: {
-			acceptThreshold: 1,				// 0 = Disabled
-			rejectThreshold: 0.75,			// 0 = Disabled
-			unattendManualNegotiate: false,
-			delayActions: {
-				enable: true,
-				longRng: [1200, 2600],
-				shortRng: [400, 800]
-			}
-		}
-	})
+	// mod.settings.$init({
+	// 	version: 1,
+	// 	defaults: {
+	// 		acceptThreshold: 1,				// 0 = Disabled
+	// 		rejectThreshold: 0.75,			// 0 = Disabled
+	// 		unattendManualNegotiate: false,
+	// 		delayActions: {
+	// 			enable: true,
+	// 			longRng: [1200, 2600],
+	// 			shortRng: [400, 800]
+	// 		}
+	// 	}
+	// })
 
 	const { command } = mod.require
 

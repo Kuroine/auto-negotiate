@@ -1,7 +1,8 @@
 {
     "files": {
         "README.md": "2559fe9984669fd86b6be53ec6046b142b7d6f61bcd9d23027eb4e5e43c6bd65",
-        "index.js": "2b6f64ff61f06b254096d195ba0ac1b1c7c6f952e3f22db108be47cfff9a9920",
+        "config.json": "e52c5e24d882a511c9981e4f940ae624edd01eae99e6b1703427826da25235e4",
+        "index.js": "8c0cff4547ecfd23a7945ceaa20b2938aab86da7f024caa98adfbc70bfe7c120",
         "module.json": "6b003ac8865e4202802a4e8ba18705a665eecda592a6f70f4bb5d1a7d097ec88"
     },
     "defs": {
