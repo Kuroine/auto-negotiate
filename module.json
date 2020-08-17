@@ -2,7 +2,7 @@
     "disableAutoUpdate": false,
     "name": "Auto-Nego",
     "author": "?_?",
-    "description": "Auto-Nego",
+    "description": "Auto Negotiate",
     "servers": ["https://raw.githubusercontent.com/Kuroine/auto-negotiate/master/"],
     "supportUrl": "https://github.com/Kuroine/auti-negotiate/issues"
 }
