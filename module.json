@@ -3,6 +3,6 @@
     "name": "auto-negotiate",
     "author": "K",
     "description": "Description goes here.",
-    "servers": ["https://raw.githubusercontent.com/Kuroine"],
+    "servers": ["https://raw.githubusercontent.com/Kuroine/auto-negotiate/"],
     "supportUrl": "https://github.com/Kuroine"
 }
