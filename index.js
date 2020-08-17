@@ -60,7 +60,7 @@ module.exports = function AutoNegotiate(mod) {
 		}
 	})
 
-	mod.hook('S_REQUEST_CONTRACT', 2, event => {
+	mod.hook('S_REQUEST_CONTRACT', 1, event => {
 		if(currentDeal && (event.type === CONTRACT_DEAL_REPLY || event.type === CONTRACT_DEAL)) {
 			currentContract = event
 			resetInactiveTimeout()
