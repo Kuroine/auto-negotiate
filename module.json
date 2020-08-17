@@ -1,0 +1,8 @@
+{
+    "disableAutoUpdate": false,
+    "name": "auto-negotiate",
+    "author": "K",
+    "description": "Description goes here.",
+    "servers": ["https://raw.githubusercontent.com/Kuroine"],
+    "supportUrl": "https://github.com/Kuroine"
+}
