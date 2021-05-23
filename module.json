@@ -3,6 +3,14 @@
     "name": "auto-nego",
     "author": "Kae",
     "description": "Auto negotiation",
+    "options": {
+        "niceName": "Nego",
+        "guiName": "Negotiator",
+        "settingsVersion": 1,
+        "settingsFile": "config.json",
+        "settingsMigrator": "settings_migrator.js"
+    },
     "servers": ["https://raw.githubusercontent.com/Kuroine/auto-negotiate/master/"],
-    "supportUrl": "https://github.com/Kuroine/auto-negotiate/issues"
+    "supportUrl": "https://github.com/Kuroine/auto-negotiate/issues",
+    "conflicts": ["auto-negotiate","auto-negotiate-master","auto-nego"]
 }
