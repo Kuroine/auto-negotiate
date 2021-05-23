@@ -1,119 +1,50 @@
-const CONTRACT_DEAL_REPLY = 35,
-	CONTRACT_DEAL = 36
+'use strict'
 
-module.exports = function AutoNegotiate(mod) {
-	// mod.settings.$init({
-	// 	version: 1,
-	// 	defaults: {
-	// 		acceptThreshold: 1,				// 0 = Disabled
-	// 		rejectThreshold: 0.75,			// 0 = Disabled
-	// 		unattendManualNegotiate: false,
-	// 		delayActions: {
-	// 			enable: true,
-	// 			longRng: [1200, 2600],
-	// 			shortRng: [400, 800]
-	// 		}
-	// 	}
-	// })
+const ACTION_DELAY_LONG_MS = [1800, 2800],	// [Min, Max]
+	ACTION_DELAY_SHORT_MS = [600, 1000],	// [Min, Max]
+	TYPE_NEGOTIATION_PENDING = 35,
+	TYPE_NEGOTIATION = 36
 
-	const { command } = mod.require
+module.exports = function Negotiator(mod) {
 
-	const pendingDeals = [],
-		recentDeals = new Map()
-	let currentDeal = null,
+	let recentDeals = mod.settings.UNATTENDED_MANUAL_NEGOTIATE ? {} : null,
+		pendingDeals = [],
+		currentDeal = null,
 		currentContract = null,
-		actionTimer = null,
-		cancelTimer = null,
-		lastErrorTimestamp = 0
+		actionTimeout = null,
+		cancelTimeout = null,
+		niceName = mod.proxyAuthor !== 'caali' ? '[Nego] ' : ''
 
-	mod.hook('S_TRADE_BROKER_DEAL_SUGGESTED', 1, event => {
-		const dealId = BigInt(event.playerId) << 32n | BigInt(event.listing)
+	// ############# //
+	// ### Hooks ### //
+	// ############# //
 
-		// Remove prior now-invalid deal
+	mod.hook('S_TRADE_BROKER_DEAL_SUGGESTED', 1, {order: 100, filter: {fake: null}}, event => {
+		// Remove old deals that haven't been processed yet
 		for(let i = 0; i < pendingDeals.length; i++) {
-			const deal = pendingDeals[i]
+			let deal = pendingDeals[i]
 
-			if(deal.playerId === event.playerId && deal.listing === event.listing) {
-				pendingDeals.splice(i--, 1)
-				break
-			}
-		}
-		// Remove recent deal
-		{
-			const oldDeal = recentDeals.get(dealId)
-			if(oldDeal) {
-				recentDeals.delete(dealId)
-				mod.clearTimeout(oldDeal.timeout)
-			}
+			if(deal.playerId == event.playerId && deal.listing == event.listing) pendingDeals.splice(i--, 1)
 		}
 
-		// Handle this deal proxy-side
-		if(comparePrice(event.sellerPrice, event.offeredPrice) !== 0) {
+		if(comparePrice(event.offeredPrice, event.sellerPrice) != 0) {
 			pendingDeals.push(event)
-			queueNextDeal()
+			queueNextDeal(true)
 			return false
 		}
-		// Temporarily store deal info for unattended manual negotiation
-		else if(mod.settings.unattendManualNegotiate) {
-			event.timeout = mod.setTimeout(() => { recentDeals.delete(dealId) }, 30000)
-			recentDeals.set(dealId, event)
-		}
-	})
+		else if(mod.settings.UNATTENDED_MANUAL_NEGOTIATE) {
+			let dealId = event.playerId + '-' + event.listing
 
-	mod.hook('S_REQUEST_CONTRACT', 1, event => {
-		if(currentDeal && (event.type === CONTRACT_DEAL_REPLY || event.type === CONTRACT_DEAL)) {
-			currentContract = event
-			resetInactiveTimeout()
+			if(recentDeals[dealId]) clearTimeout(recentDeals[dealId].timeout)
 
-			if(event.type === CONTRACT_DEAL) {
-				const parsed = {
-					tradeId: event.param.readUInt32LE(0),
-					itemId: event.param.readInt32LE(4),
-					itemAmount: event.param.readInt32LE(8),
-					itemEnchant: event.param.readInt32LE(12),
-					sellerPrice: event.param.readBigInt64LE(16),
-					offeredPrice: event.param.readBigInt64LE(24),
-					fee: event.param.readBigInt64LE(32),
-					isSeller: !!event.param[40],
-					junk: event.param[41],									// BHS forgot to initialize this byte :')
-					buyerName: event.param.slice(42, 116).toString('ucs2'),	// ...and these strings
-					sellerName: event.param.slice(116, 190).toString('ucs2'),
-					unidentifiedItemGrade: event.param.readInt32LE(190),
-					masterwork: !!event.param[194],
-					awakened: !!event.param[195],
-					unbindCount: event.param.readInt32LE(196)
-				}
-				parsed.buyerName = parsed.buyerName.slice(0, parsed.buyerName.indexOf('\0'))
-				parsed.sellerName = parsed.sellerName.slice(0, parsed.sellerName.indexOf('\0'))
-
-				// Sanity check
-				if(parsed.tradeId !== currentDeal.listing
-					|| parsed.itemId !== currentDeal.item
-					|| parsed.itemAmount !== currentDeal.amount
-					|| parsed.itemEnchant !== currentDeal.enchant
-					|| parsed.sellerPrice !== currentDeal.sellerPrice
-					|| !parsed.isSeller
-					|| parsed.buyerName !== currentDeal.name
-					|| parsed.sellerName !== event.sourceName
-				) {
-					endDeal(true)
-					command.message('Error: Negotiation contract mismatch.')
-					return false
-				}
-				// Note: This can trigger if the buyer sends a second, lower priced offer before our response reaches the server
-				if(comparePrice(currentDeal.sellerPrice, parsed.offeredPrice) !== 1) {
-					endDeal(true)
-					command.message('Negotiation terminated: Price mismatch.')
-					return false
-				}
-			}
-			return false
+			recentDeals[dealId] = event
+			recentDeals[dealId].timeout = setTimeout(() => { delete recentDeals[dealId] }, 30000)
 		}
 	})
 
 	mod.hook('S_TRADE_BROKER_REQUEST_DEAL_RESULT', 1, event => {
 		if(currentDeal) {
-			if(!event.ok) endDeal() // Deal was expired, so we move on to the next one
+			if(!event.ok) endDeal()
 
 			return false
 		}
@@ -121,22 +52,29 @@ module.exports = function AutoNegotiate(mod) {
 
 	mod.hook('S_TRADE_BROKER_DEAL_INFO_UPDATE', 1, event => {
 		if(currentDeal) {
-			if(event.buyerStage === 2 && event.sellerStage < 2)
-				actionTimer = mod.setTimeout(() => {
-					actionTimer = null
+			if(event.buyerStage == 2 && event.sellerStage < 2) {
+				let deal = currentDeal
 
-					if(event.price >= currentDeal.offeredPrice)
-						mod.send('C_TRADE_BROKER_DEAL_CONFIRM', 1, {
+				// This abandoned timeout is not a good design, but it's unlikely that it will cause any issues
+				setTimeout(() => {
+					if(currentDeal && deal.playerId == currentDeal.playerId && deal.listing == currentDeal.listing && BigInt(event.price) >= BigInt(currentDeal.offeredPrice)) {
+						mod.toServer('C_TRADE_BROKER_DEAL_CONFIRM', 1, {
 							listing: currentDeal.listing,
 							stage: event.sellerStage + 1
 						})
-					// Note: This should never happen unless this packet changed or an exploit is introduced
-					else {
-						endDeal(true)
-						command.message('Error: Price was lowered during negotiation!')
 					}
-				}, event.sellerStage === 0 ? rng(mod.settings.delayActions.shortRng) : 0)
+					else endDeal() // We negotiated the wrong one, whoops! - TODO: Inspect S_REQUEST_CONTRACT.data for price and other info
+				}, event.sellerStage == 0 ? rng(ACTION_DELAY_SHORT_MS) : 0)
+			}
 
+			return false
+		}
+	})
+
+	mod.hook('S_REQUEST_CONTRACT', 1, event => {
+		if(currentDeal && (event.type == TYPE_NEGOTIATION_PENDING || event.type == TYPE_NEGOTIATION)) {
+			currentContract = event
+			setEndTimeout()
 			return false
 		}
 	})
@@ -144,45 +82,26 @@ module.exports = function AutoNegotiate(mod) {
 	mod.hook('S_REPLY_REQUEST_CONTRACT', 1, replyOrAccept)
 	mod.hook('S_ACCEPT_CONTRACT', 1, replyOrAccept)
 
-	function replyOrAccept(event) {
-		if(currentDeal && event.type === CONTRACT_DEAL_REPLY) {
-			resetInactiveTimeout()
-			return false
-		}
-	}
-
-	mod.hook('S_CANCEL_CONTRACT', 1, event => {
-		if(currentDeal && (event.type === CONTRACT_DEAL_REPLY || event.type === CONTRACT_DEAL)) {
-			lastErrorTimestamp = Date.now()
-			currentContract = null
-			endDeal()
-			return false
-		}
-	})
-
-	mod.hook('S_TIMEOVER_CONTRACT', 1, event => {
-		if(currentDeal && (event.type === CONTRACT_DEAL_REPLY || event.type === CONTRACT_DEAL)) {
-			command.message('Negotiation timed out.')
-
-			lastErrorTimestamp = Date.now()
-			currentContract = null
-			endDeal()
-			return false
-		}
-	})
-
 	mod.hook('S_REJECT_CONTRACT', 1, event => {
-		if(currentDeal && (event.type === CONTRACT_DEAL_REPLY || event.type === CONTRACT_DEAL)) {
-			command.message(currentDeal.name + ' aborted negotiation.')
+		if(currentDeal && (event.type == TYPE_NEGOTIATION_PENDING || event.type == TYPE_NEGOTIATION)) {
+			mod.command.message(niceName + currentDeal.name + ' aborted negotiation')
+			if(mod.settings.log) console.log(now() + ' [Nego] ' + currentDeal.name + ' aborted negotiation')
 
 			// Fix listing becoming un-negotiable (server-side) if the other user aborts the initial dialog
-			if(event.type === CONTRACT_DEAL_REPLY)
-				mod.send('C_TRADE_BROKER_REJECT_SUGGEST', 1, {
+			if(event.type == TYPE_NEGOTIATION_PENDING)
+				mod.toServer('C_TRADE_BROKER_REJECT_SUGGEST', 1, {
 					playerId: currentDeal.playerId,
 					listing: currentDeal.listing
 				})
 
-			lastErrorTimestamp = Date.now()
+			currentContract = null
+			endDeal()
+			return false
+		}
+	})
+
+	mod.hook('S_CANCEL_CONTRACT', 1, event => {
+		if(currentDeal && (event.type == TYPE_NEGOTIATION_PENDING || event.type == TYPE_NEGOTIATION)) {
 			currentContract = null
 			endDeal()
 			return false
@@ -190,123 +109,208 @@ module.exports = function AutoNegotiate(mod) {
 	})
 
 	mod.hook('S_SYSTEM_MESSAGE', 1, event => {
-		if(currentDeal || lastErrorTimestamp >= Date.now() - 1000)
+		if(currentDeal) {
 			try {
 				const msg = mod.parseSystemMessage(event.message)
 
-				switch(msg.id) {
-					case 'SMT_MEDIATE_TRADE_CANCEL_ME':
-						lastErrorTimestamp = 0
-						command.message('Negotiation interrupted.')
-						return false
-					case 'SMT_MEDIATE_TRADE_CANCEL_OPPONENT':
-						if(currentDeal) {
-							command.message(currentDeal.name + ' cancelled negotiation.')
-							return false
-						}
-					case 'SMT_MEDIATE_DISCONNECT_CANCEL_OFFER_BY_ME': // C_TRADE_BROKER_REJECT_SUGGEST error message
-						lastErrorTimestamp = 0
-						return false
+				//if(msg.id === 'SMT_MEDIATE_DISCONNECT_CANCEL_OFFER_BY_ME' || msg.id === 'SMT_MEDIATE_TRADE_CANCEL_ME') return false
+				if(msg.id === 'SMT_MEDIATE_TRADE_CANCEL_OPPONENT') {
+					mod.command.message(niceName + currentDeal.name + ' cancelled negotiation')
+					if(mod.settings.log) console.log(now() + ' [Nego] ' + currentDeal.name + ' cancelled negotiation')
+					return false
+				}
+				else if(msg.id === 'SMT_MEDIATE_SUCCESS_SELL') {
+					mod.command.message(niceName + 'Negotiation with ' + currentDeal.name + ' successful')
+					if(mod.settings.log) console.log(now() + ' [Nego] Negotiation with ' + currentDeal.name + ' successful')
+					return false
 				}
 			}
 			catch(e) {}
-	})
-
-	// Handle unattended manual negotiations
-	mod.hook('C_REQUEST_CONTRACT', 2, event => {
-		if(!mod.settings.unattendManualNegotiate) return
-
-		if(event.type === CONTRACT_DEAL_REPLY) {
-			const deal = recentDeals.get(BigInt(event.param.readUInt32LE(0)) << 32n | BigInt(event.param.readUInt32LE(4)))
-			if(deal) {
-				currentDeal = deal
-				command.message('Handling negotiation with ' + currentDeal.name + '...')
-				process.nextTick(() => { mod.send('S_REPLY_REQUEST_CONTRACT', 1, { type: event.type }) })
-			}
 		}
 	})
 
-	function queueNextDeal(fast) {
-		if(!currentDeal && !actionTimer)
-			actionTimer = mod.setTimeout(tryNextDeal, rng(fast ? mod.settings.delayActions.shortRng : mod.settings.delayActions.longRng))
+	if(mod.settings.UNATTENDED_MANUAL_NEGOTIATE)
+		mod.hook('C_REQUEST_CONTRACT', 1, event => {
+			if(event.type == 35) {
+				let deal = recentDeals[event.data.readUInt32LE(0) + '-' + event.data.readUInt32LE(4)]
+
+				if(deal) {
+					currentDeal = deal
+					mod.command.message(niceName + 'Handling negotiation with ' + currentDeal.name + '...')
+					process.nextTick(() => {
+						mod.toClient('S_REPLY_REQUEST_CONTRACT', 1, { type: event.type })
+					})
+				}
+			}
+		})
+
+	// ################# //
+	// ### Functions ### //
+	// ################# //
+
+	function replyOrAccept(event) {
+		if(currentDeal && event.type == TYPE_NEGOTIATION_PENDING) {
+			setEndTimeout()
+			return false
+		}
+	}
+
+	// 1 = Auto Accept, 0 = No Action, -1 = Auto-decline
+	function comparePrice(offer, seller) {
+		if(mod.settings.AUTO_ACCEPT_THRESHOLD && BigInt(offer) >= (BigInt(seller) * BigInt(mod.settings.AUTO_ACCEPT_THRESHOLD)) / 100n) return 1
+		if(mod.settings.AUTO_REJECT_THRESHOLD && BigInt(offer) < (BigInt(seller) * BigInt(mod.settings.AUTO_REJECT_THRESHOLD)) / 100n) return -1
+		return 0
+	}
+
+	function queueNextDeal(slow) {
+		if(!actionTimeout && !currentDeal)
+			actionTimeout = setTimeout(tryNextDeal, mod.settings.DELAY_ACTIONS ? rng(slow ? ACTION_DELAY_LONG_MS : ACTION_DELAY_SHORT_MS) : 0)
 	}
 
 	function tryNextDeal() {
-		clearTimeout(actionTimer)
-		actionTimer = null
+		actionTimeout = null
 
 		if(!(currentDeal = pendingDeals.shift())) return
 
-		if(comparePrice(currentDeal.sellerPrice, currentDeal.offeredPrice) === 1) {
-			command.message(`Attempting to negotiate with ${currentDeal.name}...`)
-			command.message(`Price: ${formatGold(currentDeal.sellerPrice)} - Offered: ${formatGold(currentDeal.offeredPrice)}`)
+		if(comparePrice(currentDeal.offeredPrice, currentDeal.sellerPrice) == 1) {
+			mod.command.message(niceName + 'Attempting to negotiate with ' + currentDeal.name + ' for ' + conv(currentDeal.item) + '(' + currentDeal.amount + ')...')
+			mod.command.message(niceName + 'Price: ' + formatGold(currentDeal.sellerPrice) + ' - Offered: ' + formatGold(currentDeal.offeredPrice))
+			if(mod.settings.log) console.log(now() + ' [Nego] Attempting to negotiate with ' + currentDeal.name + ' for ' + conv(currentDeal.item) + '(' + currentDeal.amount + ')...\n'
+				+ '             Price: ' + formatGoldConsole(currentDeal.sellerPrice) + ' - Offered: ' + formatGoldConsole(currentDeal.offeredPrice))
 
-			const param = Buffer.alloc(30)
-			param.writeUInt32LE(currentDeal.playerId, 0)
-			param.writeUInt32LE(currentDeal.listing, 4)
-			mod.send('C_REQUEST_CONTRACT', 2, { type: 35, param })
+			const data = Buffer.alloc(30)
+			data.writeUInt32LE(currentDeal.playerId, 0)
+			data.writeUInt32LE(currentDeal.listing, 4)
+
+			mod.toServer('C_REQUEST_CONTRACT', 1, {
+				type: 35,
+				unk2: 0,
+				unk3: 0,
+				unk4: 0,
+				name: '',
+				data
+			})
 		}
 		else {
-			command.message(`Declined negotiation from ${currentDeal.name}.`)
-			command.message(`Price: ${formatGold(currentDeal.sellerPrice)} - Offered: ${formatGold(currentDeal.offeredPrice)}`)
+			mod.toServer('C_TRADE_BROKER_REJECT_SUGGEST', 1, {
+				playerId: currentDeal.playerId,
+				listing: currentDeal.listing
+			})
 
-			mod.send('C_TRADE_BROKER_REJECT_SUGGEST', 1, { playerId: currentDeal.playerId, listing: currentDeal.listing })
-			lastErrorTimestamp = Date.now()
+			mod.command.message(niceName + 'Declined negotiation from ' + currentDeal.name + ' for ' + conv(currentDeal.item) + '(' + currentDeal.amount + ')')
+			mod.command.message(niceName + 'Price: ' + formatGold(currentDeal.sellerPrice) + ' - Offered: ' + formatGold(currentDeal.offeredPrice))
+			if(mod.settings.log) console.log(now() + ' [Nego] Declined negotiation from ' + currentDeal.name + ' for ' + conv(currentDeal.item) + '(' + currentDeal.amount + ')\n'
+				+ '             Price: ' + formatGoldConsole(currentDeal.sellerPrice) + ' - Offered: ' + formatGoldConsole(currentDeal.offeredPrice))
+
 			currentDeal = null
-			queueNextDeal(true)
+			queueNextDeal()
 		}
 	}
 
-	function resetInactiveTimeout() {
-		mod.clearTimeout(cancelTimer)
-		cancelTimer = mod.setTimeout(endDeal, pendingDeals.length ? 15000 : 30000)
+	function setEndTimeout() {
+		clearTimeout(cancelTimeout)
+		cancelTimeout = setTimeout(endDeal, pendingDeals.length ? 15000 : 30000)
 	}
 
-	function endDeal(silent) {
-		mod.clearTimeout(actionTimer)
-		mod.clearTimeout(cancelTimer)
-		actionTimer = null
+	function endDeal() {
+		clearTimeout(cancelTimeout)
 
 		if(currentContract) {
-			mod.send('C_CANCEL_CONTRACT', 1, { type: currentContract.type, id: currentContract.id })
-			// In case the server never replies
-			currentContract = null
-			resetInactiveTimeout()
+			mod.command.message(niceName + 'Negotiation timed out')
+			if(mod.settings.log) console.log(now() + ' [Nego] Negotiation timed out')
 
-			if(!silent) command.message('Negotiation timed out.')
+			mod.toServer('C_CANCEL_CONTRACT', 1, {
+				type: currentContract.type,
+				id: currentContract.id
+			})
+			currentContract = null
+			setEndTimeout()
 			return
 		}
 
 		currentDeal = null
-		queueNextDeal(true)
+		queueNextDeal()
 	}
 
-	// 1 = Auto Accept, 0 = No Action, -1 = Auto-decline
-	function comparePrice(sellerPrice, offeredPrice) {
-		// Convert from BigInt since 48 bits is still higher than the maximum broker price
-		sellerPrice = Number(sellerPrice)
-		offeredPrice = Number(offeredPrice)
+	function formatGold(gold) {
+		gold = gold.toString()
 
-		const acceptThreshold = mod.settings.acceptThreshold,
-			rejectThreshold = mod.settings.rejectThreshold
+		let str = ''
+		if(gold.length > 4) str += '<font color="#ffb033">' + Number(gold.slice(0, -4)).toLocaleString() + 'g</font>'
+		if(gold.length > 2) str += '<font color="#d7d7d7">' + gold.slice(-4, -2) + 's</font>'
+		str += '<font color="#c87551">' + gold.slice(-2) + 'c</font>'
 
-		if(acceptThreshold > 0 && offeredPrice >= acceptThreshold * sellerPrice) return 1
-		if(rejectThreshold > 0 && offeredPrice < rejectThreshold * sellerPrice) return -1
-		return 0
+		return str
+	}
+
+	function formatGoldConsole(gold) {
+		gold = gold.toString()
+
+		let str = ''
+		if(gold.length > 4) str += Number(gold.slice(0, -4)).toLocaleString() + 'g'
+		if(gold.length > 2) str += gold.slice(-4, -2) + 's'
+		str += gold.slice(-2) + 'c'
+
+		return str
 	}
 
 	function rng([min, max]) {
-		return mod.settings.delayActions.enable ? min + Math.floor(Math.random() * (max - min + 1)) : 0
+		return min + Math.floor(Math.random() * (max - min + 1))
 	}
-}
 
-function formatGold(gold) {
-	gold = gold.toString()
+	function now() { 
+		return new Date().toLocaleTimeString().replace(/([\d]+:[\d]{2})(:[\d]{2})(.*)/, "$1$3")
+	}
 
-	let str = ''
-	if(gold.length > 4) str += '<font color="#ffb033">' + Number(gold.slice(0, -4)).toLocaleString() + 'g</font>'
-	if(gold.length > 2) str += '<font color="#d7d7d7">' + gold.slice(-4, -2) + 's</font>'
-	str += '<font color="#c87551">' + gold.slice(-2) + 'c</font>'
+	function conv(s) {
+		const data = mod.game.data.items.get(s)
+		return data ? data.name : "Undefined"
+	}
 
-	return str
+	// ################ //
+	// ### Commands ### //
+	// ################ //
+
+	mod.command.add('nego', (cmd, value) => {
+		switch (cmd) {
+			case "accept":
+				if(value) {
+					mod.settings.AUTO_ACCEPT_THRESHOLD = Number(value)
+					mod.command.message(niceName + 'Auto accept threshold set to <font color="#F0E442">' + mod.settings.AUTO_ACCEPT_THRESHOLD + '</font>')
+					console.log('[Nego] Auto accept threshold set to ' + mod.settings.AUTO_ACCEPT_THRESHOLD)
+				}
+				break
+			case "decline":
+			case "reject":
+				if(value) {
+					mod.settings.AUTO_REJECT_THRESHOLD = Number(value)
+					mod.command.message(niceName + 'Auto reject threshold set to <font color="#F0E442">' + mod.settings.AUTO_REJECT_THRESHOLD + '</font>')
+					console.log('[Nego] Auto reject threshold set to ' + mod.settings.AUTO_REJECT_THRESHOLD)
+				}
+				break
+			case "unattended":
+				mod.settings.UNATTENDED_MANUAL_NEGOTIATE = !mod.settings.UNATTENDED_MANUAL_NEGOTIATE
+				mod.command.message(niceName + 'Unattended manual negotiation ' + (mod.settings.UNATTENDED_MANUAL_NEGOTIATE ? '<font color="#56B4E9">enabled</font>' : '<font color="#E69F00">disabled</font>'))
+				console.log('[Nego] Unattended manual negotiation ' + (mod.settings.UNATTENDED_MANUAL_NEGOTIATE ? 'enabled' : 'disabled'))
+				break
+			case "delay":
+				mod.settings.DELAY_ACTIONS = !mod.settings.DELAY_ACTIONS
+				mod.command.message(niceName + 'Human-like behavior ' + (mod.settings.DELAY_ACTIONS ? '<font color="#56B4E9">enabled</font>' : '<font color="#E69F00">disabled</font>'))
+				console.log('[Nego] Human-like behavior ' + (mod.settings.DELAY_ACTIONS ? 'enabled' : 'disabled'))
+				break
+			case "log":
+				mod.settings.log = !mod.settings.log
+				mod.command.message(niceName + 'Logging to console ' + (mod.settings.log ? '<font color="#56B4E9">enabled</font>' : '<font color="#E69F00">disabled</font>'))
+				console.log('[Nego] Logging to console ' + (mod.settings.log ? 'enabled' : 'disabled'))
+				break
+			default:
+				mod.command.message('Commands:\n' 
+					+ ' "nego accept [x]" (change the minimum percentage to accept a deal, e.g. "nego accept 100" [0 to disable])\n'
+					+ ' "nego reject [x]" (change the maximum percentage to reject a deal, e.g. "nego reject 75" [0 to disable])\n'
+					+ ' "nego unattended" (enable/disable automatically accepting deals after clicking the "Accept" link in chat)\n'
+					+ ' "nego delay" (switch between human-like behavior and immediate negotiation)\n'
+					+ ' "nego log" (enable/disable logging to console)'
+				)
+		}
+	})
 }
